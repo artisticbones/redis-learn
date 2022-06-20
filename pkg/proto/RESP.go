@@ -1,8 +1,12 @@
 package proto
 
 import (
+	"bufio"
+	"errors"
 	"github.com/artisticbones/redis-learn/internal/redis"
 	"io"
+	"log"
+	"runtime/debug"
 )
 
 /**
@@ -31,6 +35,84 @@ func ParseStream(reader io.Reader) <-chan *Payload {
 	return ch
 }
 
-func parse0(reader io.Reader, ch chan<- *Payload) {
+type readState struct {
+	readingMultiLine  bool
+	expectedArgsCount int
+	msgType           byte
+	args              [][]byte
+	bulkLen           int64
+}
 
+func parse0(reader io.Reader, ch chan<- *Payload) {
+	defer func() {
+		if err := recover(); err != nil {
+			log.Fatalf(string(debug.Stack()))
+		}
+	}()
+	// 初始化读取状态
+	bufReader := bufio.NewReader(reader)
+	var state readState
+	var err error
+	var msg []byte
+	for true {
+		// read line
+		// 上文中我们提到 RESP 是以行为单位的
+		// 因为行分为简单字符串和二进制安全的BulkString，我们需要封装一个 readLine 函数来兼容
+		msg, err = readLine(bufReader, &state)
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			ch <- &Payload{
+				Err: err,
+			}
+			close(ch)
+			return
+		}
+		if err != nil {
+			// protocol err, reset read state
+			ch <- &Payload{
+				Err: err,
+			}
+			state = readState{}
+			continue
+		}
+		// 接下来我们对刚刚读取的行进行解析
+		// 我们简单的将 Reply 分为两类:
+		// 单行: StatusReply, IntReply, ErrorReply
+		// 多行: BulkReply, MultiBulkReply
+		if !state.readingMultiLine {
+			if msg[0] == '*' {
+				err = parseMultiBulkHeader(msg, &state)
+			}
+		}
+	}
+}
+
+func parseMultiBulkHeader(msg []byte, r *readState) error {
+	return nil
+}
+
+func readLine(bufReader *bufio.Reader, state *readState) ([]byte, error) {
+	var msg []byte
+	var err error
+	if state.bulkLen == 0 { // read normal line
+		msg, err = bufReader.ReadBytes('\n')
+		if err != nil {
+			return nil, err
+		}
+		if len(msg) == 0 || msg[len(msg)-2] != '\r' {
+			return nil, errors.New("protocol error: " + string(msg))
+		}
+	} else { // read bulk line (binary safe)
+		msg = make([]byte, state.bulkLen+2)
+		_, err = io.ReadFull(bufReader, msg)
+		if err != nil {
+			return nil, err
+		}
+		if len(msg) == 0 ||
+			msg[len(msg)-2] != '\r' ||
+			msg[len(msg)-1] != '\n' {
+			return nil, errors.New("protocol error: " + string(msg))
+		}
+		state.bulkLen = 0
+	}
+	return msg, nil
 }
